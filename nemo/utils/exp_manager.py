@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from shutil import copy, move
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Collection, Dict, List, Optional, Tuple, Union
 
 import pytorch_lightning
 import torch
@@ -51,11 +51,11 @@ from nemo.utils.model_utils import uninject_model_parallel_rank
 
 
 class NotFoundError(NeMoBaseException):
-    """ Raised when a file or folder is not found"""
+    """Raised when a file or folder is not found"""
 
 
 class LoggerMisconfigurationError(NeMoBaseException):
-    """ Raised when a mismatch between trainer.logger and exp_manager occurs"""
+    """Raised when a mismatch between trainer.logger and exp_manager occurs"""
 
     def __init__(self, message):
         message = (
@@ -66,7 +66,7 @@ class LoggerMisconfigurationError(NeMoBaseException):
 
 
 class CheckpointMisconfigurationError(NeMoBaseException):
-    """ Raised when a mismatch between trainer.callbacks and exp_manager occurs"""
+    """Raised when a mismatch between trainer.callbacks and exp_manager occurs"""
 
 
 @dataclass
@@ -106,6 +106,7 @@ class CallbackParams:
     save_nemo_on_train_end: Optional[bool] = True  # Whether to automatically save .nemo file durin on_train_end hook
     model_parallel_size: Optional[int] = None  # tensor parallel size * pipeline parallel size
     save_on_train_epoch_end: Optional[bool] = False  # Save after training, not after validation
+    async_save: Optional[bool] = False  # save the checkpoint asynchronously
 
 
 @dataclass
@@ -128,8 +129,7 @@ class EMAParams:
 
 @dataclass
 class ExpManagerConfig:
-    """Experiment Manager config for validation of passed arguments.
-    """
+    """Experiment Manager config for validation of passed arguments."""
 
     # Log dir creation parameters
     explicit_log_dir: Optional[str] = None
@@ -304,16 +304,16 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
                 recent checkpoint under ``*last.ckpt``, and the final checkpoint after training completes under ``*end.ckpt``.
                 Defaults to True.
             - create_early_stopping_callback (bool): Flag to decide if early stopping should be used to stop training. Default is False.
-             See EarlyStoppingParams dataclass above.
+                See EarlyStoppingParams dataclass above.
             - create_preemption_callback (bool): Flag to decide whether to enable preemption callback to save checkpoints and exit training
-             immediately upon preemption. Default is True.
+                immediately upon preemption. Default is True.
             - files_to_copy (list): A list of files to copy to the experiment logging directory. Defaults to None which
                 copies no files.
             - log_local_rank_0_only (bool): Whether to only create log files for local rank 0. Defaults to False.
                 Set this to True if you are using DDP with many GPUs and do not want many log files in your exp dir.
             - log_global_rank_0_only (bool): Whether to only create log files for global rank 0. Defaults to False.
                 Set this to True if you are using DDP with many GPUs and do not want many log files in your exp dir.
-            - max_time (str): The maximum wall clock time *per run*. This is intended to be used on clusters where you want 
+            - max_time (str): The maximum wall clock time *per run*. This is intended to be used on clusters where you want
                 a checkpoint to be saved after this specified time and be able to resume from that checkpoint. Defaults to None.
             - seconds_to_sleep (float): seconds to sleep non rank 0 processes for. Used to give enough time for rank 0 to initialize
 
@@ -336,12 +336,16 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
 
     # Ensure passed cfg is compliant with ExpManagerConfig
     schema = OmegaConf.structured(ExpManagerConfig)
+    # TODO: remove this check
+    if is_global_rank_zero():
+        logging.info('ExpManager schema')
+        logging.info(schema)
     if isinstance(cfg, dict):
         cfg = OmegaConf.create(cfg)
     elif not isinstance(cfg, DictConfig):
         raise ValueError(f"cfg was type: {type(cfg)}. Expected either a dict or a DictConfig")
     cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    cfg = OmegaConf.merge(schema, cfg)
+    cfg = OmegaConf.merge(schema, cfg)  # type: ExpManagerConfig
 
     error_checks(trainer, cfg)  # Ensures that trainer options are compliant with NeMo and exp_manager arguments
 
@@ -564,6 +568,18 @@ def error_checks(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictC
         )
 
 
+def _filter_out_unfinished_checkpoints(checkpoint_paths: Collection[Union[Path, str]]) -> Collection[Union[Path, str]]:
+    res = []
+    for chkpt_path in checkpoint_paths:
+        if NeMoModelCheckpoint.is_checkpoint_unfinished(chkpt_path):
+            logging.warning(
+                f'Checkpoint {chkpt_path} has the unfinished marker set - skipped while looking for the last one.'
+            )
+        else:
+            res.append(chkpt_path)
+    return res
+
+
 def check_resume(
     trainer: 'pytorch_lightning.Trainer',
     log_dir: str,
@@ -604,7 +620,9 @@ def check_resume(
         last_dist_checkpoints = [d for d in dist_checkpoints if d.match("*last")]
 
         end_checkpoints = end_dist_checkpoints if end_dist_checkpoints else list(checkpoint_dir.rglob("*end.ckpt"))
+        end_checkpoints = _filter_out_unfinished_checkpoints(end_checkpoints)
         last_checkpoints = last_dist_checkpoints if last_dist_checkpoints else list(checkpoint_dir.rglob("*last.ckpt"))
+        last_checkpoints = _filter_out_unfinished_checkpoints(last_checkpoints)
 
         if not checkpoint_dir.exists() or (not len(end_checkpoints) > 0 and not len(last_checkpoints) > 0):
             if resume_ignore_no_checkpoint:
@@ -667,7 +685,7 @@ def check_resume(
 def check_explicit_log_dir(
     trainer: 'pytorch_lightning.Trainer', explicit_log_dir: Union[Path, str], exp_dir: str, name: str, version: str
 ) -> Tuple[Path, str, str, str]:
-    """ Checks that the passed arguments are compatible with explicit_log_dir.
+    """Checks that the passed arguments are compatible with explicit_log_dir.
 
     Returns:
         log_dir (Path): the log_dir
@@ -904,7 +922,7 @@ def configure_checkpointing(
     params: 'DictConfig',
     create_preemption_callback: bool,
 ):
-    """ Adds ModelCheckpoint to trainer. Raises CheckpointMisconfigurationError if trainer already has a ModelCheckpoint
+    """Adds ModelCheckpoint to trainer. Raises CheckpointMisconfigurationError if trainer already has a ModelCheckpoint
     callback
     """
     for callback in trainer.callbacks:
@@ -981,7 +999,12 @@ def check_slurm(trainer):
 class StatelessTimer(Timer):
     """Extension of PTL timers to be per run."""
 
-    def __init__(self, duration: timedelta = None, interval: str = Interval.step, verbose: bool = True,) -> None:
+    def __init__(
+        self,
+        duration: timedelta = None,
+        interval: str = Interval.step,
+        verbose: bool = True,
+    ) -> None:
         super().__init__(duration, interval, verbose)
 
     # Override PTL Timer's state dict to not store elapsed time information so that we can restore and continue training.
@@ -1020,10 +1043,10 @@ class SkipResumeTrainingValidationLoop(_TrainingEpochLoop):
     the training state before validation has run.
     """
 
-    def _should_check_val_fx(self) -> bool:
+    def _should_check_val_fx(self, data_fetcher) -> bool:
         if self.restarting and self.global_step % self.trainer.val_check_batch == 0:
             return False
-        return super()._should_check_val_fx()
+        return super()._should_check_val_fx(data_fetcher)
 
 
 def clean_exp_ckpt(exp_log_dir: Union[str, Path], remove_ckpt: bool = True, remove_nemo: bool = False):
